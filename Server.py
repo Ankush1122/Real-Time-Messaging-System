@@ -1,3 +1,4 @@
+import hashlib
 import socket
 import threading
 from collections import defaultdict
@@ -8,9 +9,24 @@ from chatapp_core.protocol import recv_message, send_message
 HOST = '0.0.0.0'
 PORT = 12345
 sessions = {}
+users = {}
 sessions_lock = threading.Lock()
+users_lock = threading.Lock()
 history = defaultdict(list)
 history_lock = threading.Lock()
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+
+def verify_or_create_user(user_id, password):
+    with users_lock:
+        expected = users.get(user_id)
+        if expected is None:
+            users[user_id] = hash_password(password)
+            return True
+        return expected == hash_password(password)
 
 
 def chat_key(a, b):
@@ -31,8 +47,12 @@ def push_to_user(user_id, payload):
 
 def handle_login(sock, payload):
     user_id = str(payload.get('user_id', '')).strip()
-    if not user_id:
-        send_message(sock, {'type': 'login_error', 'message': 'user_id is required'})
+    password = str(payload.get('password', '')).strip()
+    if not user_id or not password:
+        send_message(sock, {'type': 'login_error', 'message': 'user_id and password are required'})
+        return None
+    if not verify_or_create_user(user_id, password):
+        send_message(sock, {'type': 'login_error', 'message': 'invalid credentials'})
         return None
     with sessions_lock:
         old = sessions.get(user_id)
@@ -55,8 +75,7 @@ def list_chats(user_id):
                 continue
             peer = key[1] if key[0] == user_id else key[0]
             rows.append({'peer_id': peer, 'last_message': messages[-1]})
-    rows.sort(key=lambda item: item['last_message']['created_at'], reverse=True)
-    return rows
+    return sorted(rows, key=lambda item: item['last_message']['created_at'], reverse=True)
 
 
 def handle_client(sock, addr):
@@ -77,14 +96,7 @@ def handle_client(sock, addr):
                 if not receiver_id or not text:
                     send_message(sock, {'type': 'send_error', 'message': 'receiver_id and text are required'})
                     continue
-                message = {
-                    'type': 'message',
-                    'message_id': len(history[chat_key(user_id, receiver_id)]) + 1,
-                    'sender_id': user_id,
-                    'receiver_id': receiver_id,
-                    'text': text,
-                    'created_at': datetime.now(timezone.utc).isoformat(),
-                }
+                message = {'type': 'message', 'message_id': len(history[chat_key(user_id, receiver_id)]) + 1, 'sender_id': user_id, 'receiver_id': receiver_id, 'text': text, 'created_at': datetime.now(timezone.utc).isoformat()}
                 with history_lock:
                     history[chat_key(user_id, receiver_id)].append(message)
                 delivered = push_to_user(receiver_id, message)
@@ -96,8 +108,6 @@ def handle_client(sock, addr):
                 send_message(sock, {'type': 'history', 'peer_id': peer_id, 'messages': messages})
             elif event_type == 'list_chats':
                 send_message(sock, {'type': 'chat_list', 'chats': list_chats(user_id)})
-            else:
-                send_message(sock, {'type': 'error', 'message': f'unsupported type: {event_type}'})
     except (ConnectionError, OSError, ValueError):
         pass
     finally:
@@ -113,7 +123,7 @@ def main():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(512)
-    print(f'RTMS v4 listening on {HOST}:{PORT}')
+    print(f'RTMS v6 listening on {HOST}:{PORT}')
     while True:
         sock, addr = server.accept()
         threading.Thread(target=handle_client, args=(sock, addr), daemon=True).start()
