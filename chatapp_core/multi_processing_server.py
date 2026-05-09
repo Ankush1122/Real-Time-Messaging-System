@@ -1,8 +1,11 @@
 
+import base64
+import json
 import multiprocessing as mp
 import os
 import selectors
 import socket
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, Optional
@@ -10,11 +13,32 @@ from typing import Deque, Dict, Optional
 from chatapp_core.protocol import MessageReader, encode_message
 from chatapp_core.storage import PostgresStorage
 
+try:
+    import redis
+except ImportError:
+    redis = None
+
 HOST = os.getenv('CHAT_HOST', '0.0.0.0')
 PORT = int(os.getenv('CHAT_PORT', '12345'))
 PROCESS_COUNT = int(os.getenv('CHAT_PROCESSES', str(max(2, os.cpu_count() or 2))))
 BACKLOG = int(os.getenv('CHAT_BACKLOG', '4096'))
 READ_CHUNK_SIZE = 64 * 1024
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+CONTROL_PREFIX = os.getenv('CHAT_CONTROL_PREFIX', 'chat')
+PRESENCE_TTL_SECONDS = int(os.getenv('CHAT_PRESENCE_TTL_SECONDS', '90'))
+REDIS_QUEUE_TTL_SECONDS = int(os.getenv('CHAT_REDIS_QUEUE_TTL_SECONDS', str(24 * 3600)))
+
+
+def presence_key(user_id: str) -> str:
+    return f'{CONTROL_PREFIX}:presence:{user_id}'
+
+
+def route_channel(process_id: str) -> str:
+    return f'{CONTROL_PREFIX}:route:{process_id}'
+
+
+def backlog_key(user_id: str) -> str:
+    return f'{CONTROL_PREFIX}:backlog:{user_id}'
 
 
 @dataclass
@@ -27,20 +51,75 @@ class ClientSession:
     closing: bool = False
 
 
-class MultiProcessWorker:
-    """One selector loop per process.
+class RedisPlane:
+    def __init__(self, process_id: str) -> None:
+        if redis is None:
+            raise RuntimeError('redis package missing. Run: pip install redis')
+        self.process_id = process_id
+        self.channel = route_channel(process_id)
+        self.client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+        self.client.ping()
+        self.pubsub = self.client.pubsub(ignore_subscribe_messages=True)
+        self.pubsub.subscribe(self.channel)
 
-    This version introduces process-level socket scaling with SO_REUSEPORT.
-    Cross-process delivery is intentionally not handled yet; that is added in
-    the Redis routing commit that follows.
-    """
+    def set_presence(self, user_id: str) -> None:
+        payload = json.dumps({'process_id': self.process_id, 'channel': self.channel, 'ts': time.time()}).encode('utf-8')
+        self.client.set(presence_key(user_id), payload, ex=PRESENCE_TTL_SECONDS)
+
+    def clear_presence(self, user_id: Optional[str]) -> None:
+        if user_id:
+            self.client.delete(presence_key(user_id))
+
+    def get_presence(self, user_id: str) -> Optional[dict]:
+        raw = self.client.get(presence_key(user_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode('utf-8'))
+        except Exception:
+            return None
+
+    def publish_frame(self, channel: str, to_user_id: str, frame: bytes) -> int:
+        payload = {'type': 'deliver_frame', 'to_user_id': to_user_id, 'frame_b64': base64.b64encode(frame).decode('ascii')}
+        return self.client.publish(channel, json.dumps(payload).encode('utf-8'))
+
+    def push_backlog(self, user_id: str, frame: bytes) -> None:
+        pipe = self.client.pipeline(transaction=False)
+        pipe.rpush(backlog_key(user_id), frame)
+        pipe.expire(backlog_key(user_id), REDIS_QUEUE_TTL_SECONDS)
+        pipe.execute()
+
+    def pop_backlog(self, user_id: str, limit: int = 64) -> list[bytes]:
+        key = backlog_key(user_id)
+        pipe = self.client.pipeline(transaction=False)
+        for _ in range(limit):
+            pipe.lpop(key)
+        return [item for item in pipe.execute() if item is not None]
+
+    def poll(self, limit: int = 128) -> list[dict]:
+        messages = []
+        for _ in range(limit):
+            item = self.pubsub.get_message(timeout=0)
+            if item is None:
+                break
+            try:
+                messages.append(json.loads(item['data'].decode('utf-8')))
+            except Exception:
+                pass
+        return messages
+
+
+class MultiProcessWorker:
+    """SO_REUSEPORT worker with Redis presence and pub/sub routing."""
 
     def __init__(self, index: int) -> None:
         self.index = index
+        self.process_id = f'{socket.gethostname()}:{os.getpid()}:{index}'
         self.selector = selectors.DefaultSelector()
         self.sessions: Dict[socket.socket, ClientSession] = {}
         self.local_users: Dict[str, ClientSession] = {}
         self.storage = PostgresStorage()
+        self.redis = RedisPlane(self.process_id)
         self.server_socket = self._create_server_socket()
         self.selector.register(self.server_socket, selectors.EVENT_READ, self._accept)
 
@@ -56,11 +135,12 @@ class MultiProcessWorker:
         return sock
 
     def run(self) -> None:
-        print(f'process {self.index} listening on {HOST}:{PORT}')
+        print(f'process {self.index} listening on {HOST}:{PORT} with Redis routing')
         while True:
-            for key, mask in self.selector.select(timeout=1):
-                callback = key.data
-                callback(key.fileobj, mask)
+            for event in self.redis.poll():
+                self.handle_control_event(event)
+            for key, mask in self.selector.select(timeout=0.2):
+                key.data(key.fileobj, mask)
 
     def _accept(self, sock: socket.socket, _mask: int) -> None:
         conn, addr = sock.accept()
@@ -90,6 +170,10 @@ class MultiProcessWorker:
 
     def queue(self, session: ClientSession, payload: dict) -> None:
         session.outbox.append(encode_message(payload))
+        self.update_interest(session)
+
+    def queue_raw_frame(self, session: ClientSession, frame: bytes) -> None:
+        session.outbox.append(frame)
         self.update_interest(session)
 
     def flush_writes(self, session: ClientSession) -> None:
@@ -123,7 +207,10 @@ class MultiProcessWorker:
                 return
             session.user_id = user_id
             self.local_users[user_id] = session
+            self.redis.set_presence(user_id)
             self.queue(session, {'type': 'login_ok', 'user_id': user_id})
+            for frame in self.redis.pop_backlog(user_id):
+                self.queue_raw_frame(session, frame)
             return
 
         if not session.user_id:
@@ -132,41 +219,42 @@ class MultiProcessWorker:
 
         if kind == 'send_message':
             receiver_id = str(payload.get('receiver_id', '')).strip()
-            saved = self.storage.insert_message(
-                session.user_id,
-                receiver_id,
-                str(payload.get('text', '')),
-                payload.get('client_message_id'),
-            )
-            message = {
-                'type': 'message',
-                'message_id': saved.message_id,
-                'chat_id': saved.chat_id,
-                'sender_id': saved.sender_id,
-                'receiver_id': saved.receiver_id,
-                'text': saved.text,
-                'created_at': saved.created_at,
-            }
-            receiver = self.local_users.get(receiver_id)
-            delivered = False
-            if receiver:
-                self.queue(receiver, message)
-                delivered = True
-            self.queue(session, {
-                'type': 'send_ack',
-                'message_id': saved.message_id,
-                'chat_id': saved.chat_id,
-                'delivered': delivered,
-            })
+            saved = self.storage.insert_message(session.user_id, receiver_id, str(payload.get('text', '')), payload.get('client_message_id'))
+            message = {'type': 'message', 'message_id': saved.message_id, 'chat_id': saved.chat_id, 'sender_id': saved.sender_id, 'receiver_id': saved.receiver_id, 'text': saved.text, 'created_at': saved.created_at}
+            frame = encode_message(message)
+            delivered = self.deliver_frame(receiver_id, frame)
+            self.queue(session, {'type': 'send_ack', 'message_id': saved.message_id, 'chat_id': saved.chat_id, 'delivered': delivered})
         elif kind == 'fetch_history':
             self.queue(session, {'type': 'history', 'messages': self.storage.fetch_history(session.user_id, str(payload.get('peer_id', '')))})
         elif kind == 'list_chats':
             self.queue(session, {'type': 'chat_list', 'chats': self.storage.list_chats(session.user_id)})
 
+    def deliver_frame(self, receiver_id: str, frame: bytes) -> bool:
+        local = self.local_users.get(receiver_id)
+        if local:
+            self.queue_raw_frame(local, frame)
+            return True
+        presence = self.redis.get_presence(receiver_id)
+        if presence and presence.get('channel'):
+            subscribers = self.redis.publish_frame(presence['channel'], receiver_id, frame)
+            if subscribers:
+                return True
+        self.redis.push_backlog(receiver_id, frame)
+        return False
+
+    def handle_control_event(self, event: dict) -> None:
+        if event.get('type') == 'deliver_frame':
+            session = self.local_users.get(str(event.get('to_user_id')))
+            if not session:
+                return
+            frame = base64.b64decode(event.get('frame_b64', ''))
+            self.queue_raw_frame(session, frame)
+
     def close(self, session: ClientSession) -> None:
         session.closing = True
         if session.user_id and self.local_users.get(session.user_id) is session:
             self.local_users.pop(session.user_id, None)
+            self.redis.clear_presence(session.user_id)
         self.sessions.pop(session.conn, None)
         try:
             self.selector.unregister(session.conn)
