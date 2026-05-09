@@ -7,6 +7,7 @@ import selectors
 import socket
 import time
 from collections import deque
+import uuid
 from dataclasses import dataclass, field
 from typing import Deque, Dict, Optional
 
@@ -48,6 +49,7 @@ class ClientSession:
     reader: MessageReader = field(default_factory=MessageReader)
     outbox: Deque[bytes] = field(default_factory=deque)
     user_id: Optional[str] = None
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     closing: bool = False
 
 
@@ -62,13 +64,40 @@ class RedisPlane:
         self.pubsub = self.client.pubsub(ignore_subscribe_messages=True)
         self.pubsub.subscribe(self.channel)
 
-    def set_presence(self, user_id: str) -> None:
-        payload = json.dumps({'process_id': self.process_id, 'channel': self.channel, 'ts': time.time()}).encode('utf-8')
-        self.client.set(presence_key(user_id), payload, ex=PRESENCE_TTL_SECONDS)
+    def set_presence(self, user_id: str, session_id: str) -> Optional[dict]:
+        key = presence_key(user_id)
+        old_raw = self.client.get(key)
+        payload = json.dumps({
+            'process_id': self.process_id,
+            'channel': self.channel,
+            'session_id': session_id,
+            'ts': time.time(),
+        }).encode('utf-8')
+        self.client.set(key, payload, ex=PRESENCE_TTL_SECONDS)
+        if not old_raw:
+            return None
+        try:
+            return json.loads(old_raw.decode('utf-8'))
+        except Exception:
+            return None
 
-    def clear_presence(self, user_id: Optional[str]) -> None:
-        if user_id:
-            self.client.delete(presence_key(user_id))
+    def clear_presence_if_owner(self, user_id: Optional[str], session_id: Optional[str]) -> None:
+        if not user_id:
+            return
+        key = presence_key(user_id)
+        raw = self.client.get(key)
+        if not raw:
+            return
+        try:
+            current = json.loads(raw.decode('utf-8'))
+        except Exception:
+            return
+        if current.get('process_id') == self.process_id and current.get('session_id') == session_id:
+            self.client.delete(key)
+
+    def publish_kick(self, channel: str, user_id: str) -> None:
+        payload = {'type': 'kick_user', 'user_id': user_id, 'reason': 'duplicate_login'}
+        self.client.publish(channel, json.dumps(payload).encode('utf-8'))
 
     def get_presence(self, user_id: str) -> Optional[dict]:
         raw = self.client.get(presence_key(user_id))
@@ -205,10 +234,15 @@ class MultiProcessWorker:
             if not user_id or not self.storage.verify_or_create_user(user_id, password):
                 self.queue(session, {'type': 'login_error', 'message': 'invalid credentials'})
                 return
+            old_local = self.local_users.get(user_id)
+            if old_local and old_local is not session:
+                self.force_close(old_local, 'duplicate_login')
             session.user_id = user_id
             self.local_users[user_id] = session
-            self.redis.set_presence(user_id)
-            self.queue(session, {'type': 'login_ok', 'user_id': user_id})
+            old_remote = self.redis.set_presence(user_id, session.session_id)
+            if old_remote and old_remote.get('channel'):
+                self.redis.publish_kick(old_remote['channel'], user_id)
+            self.queue(session, {'type': 'login_ok', 'user_id': user_id, 'session_id': session.session_id})
             for frame in self.redis.pop_backlog(user_id):
                 self.queue_raw_frame(session, frame)
             return
@@ -249,12 +283,20 @@ class MultiProcessWorker:
                 return
             frame = base64.b64decode(event.get('frame_b64', ''))
             self.queue_raw_frame(session, frame)
+        elif event.get('type') == 'kick_user':
+            session = self.local_users.get(str(event.get('user_id')))
+            if session:
+                self.force_close(session, event.get('reason', 'duplicate_login'))
+
+    def force_close(self, session: ClientSession, reason: str) -> None:
+        self.queue(session, {'type': 'session_closed', 'reason': reason})
+        self.close(session)
 
     def close(self, session: ClientSession) -> None:
         session.closing = True
         if session.user_id and self.local_users.get(session.user_id) is session:
             self.local_users.pop(session.user_id, None)
-            self.redis.clear_presence(session.user_id)
+            self.redis.clear_presence_if_owner(session.user_id, session.session_id)
         self.sessions.pop(session.conn, None)
         try:
             self.selector.unregister(session.conn)
