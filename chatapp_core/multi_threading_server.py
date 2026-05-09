@@ -156,6 +156,12 @@ class ReactorWorker(threading.Thread):
                 receiver.worker.submit(receiver.worker.queue_frame, receiver, message)
                 delivered = True
             self.queue_frame(session, {'type': 'send_ack', 'message_id': saved.message_id, 'chat_id': saved.chat_id, 'delivered': delivered})
+        elif kind == 'message_received_ack':
+            self.storage.mark_delivered(session.user_id, int(payload.get('chat_id', 0)), int(payload.get('message_id', 0)))
+            self.queue_frame(session, {'type': 'delivery_ack_saved', 'message_id': int(payload.get('message_id', 0))})
+        elif kind == 'message_read_ack':
+            self.storage.mark_read(session.user_id, int(payload.get('chat_id', 0)), int(payload.get('message_id', 0)))
+            self.queue_frame(session, {'type': 'read_ack_saved', 'message_id': int(payload.get('message_id', 0))})
         elif kind == 'fetch_history':
             self.queue_frame(session, {'type': 'history', 'messages': self.storage.fetch_history(session.user_id, str(payload.get('peer_id', '')))})
         elif kind == 'list_chats':

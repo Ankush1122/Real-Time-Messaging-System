@@ -72,6 +72,12 @@ class ChatWindow(QtWidgets.QWidget):
     def on_message(self, payload):
         if payload.get('type') == 'message':
             self.log.append(f"{payload.get('sender_id')}: {payload.get('text')}")
+            if self.client:
+                self.client.send_payload({
+                    'type': 'message_received_ack',
+                    'chat_id': payload.get('chat_id'),
+                    'message_id': payload.get('message_id'),
+                })
         else:
             self.log.append(str(payload))
 

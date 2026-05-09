@@ -258,6 +258,12 @@ class MultiProcessWorker:
             frame = encode_message(message)
             delivered = self.deliver_frame(receiver_id, frame)
             self.queue(session, {'type': 'send_ack', 'message_id': saved.message_id, 'chat_id': saved.chat_id, 'delivered': delivered})
+        elif kind == 'message_received_ack':
+            self.storage.mark_delivered(session.user_id, int(payload.get('chat_id', 0)), int(payload.get('message_id', 0)))
+            self.queue(session, {'type': 'delivery_ack_saved', 'message_id': int(payload.get('message_id', 0))})
+        elif kind == 'message_read_ack':
+            self.storage.mark_read(session.user_id, int(payload.get('chat_id', 0)), int(payload.get('message_id', 0)))
+            self.queue(session, {'type': 'read_ack_saved', 'message_id': int(payload.get('message_id', 0))})
         elif kind == 'fetch_history':
             self.queue(session, {'type': 'history', 'messages': self.storage.fetch_history(session.user_id, str(payload.get('peer_id', '')))})
         elif kind == 'list_chats':
