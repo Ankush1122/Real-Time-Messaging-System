@@ -1,0 +1,68 @@
+{
+  "aggregate": {
+    "source_files": [
+      "load_tester/benchmark_results/aws-100k-gap50-load-1_aggregate.json",
+      "load_tester/benchmark_results/aws-100k-gap50-load-2_aggregate.json",
+      "load_tester/benchmark_results/aws-100k-gap50-load-3_aggregate.json",
+      "load_tester/benchmark_results/aws-100k-gap50-load-4_aggregate.json"
+    ],
+    "source_file_count": 4,
+    "exact_latency_percentiles": false,
+    "latency_percentile_note": "approximate, computed from aggregate file percentile summaries",
+    "clients_target": 100000,
+    "connected": 100000,
+    "login_ok": 100000,
+    "send_attempts": 602851,
+    "server_ack": 602851,
+    "received": 602802,
+    "offline": 0,
+    "pending_ack": 0,
+    "errors": 0,
+    "disconnects": 0,
+    "login_timeouts": 0,
+    "connect_exceptions": 0,
+    "measured_window_seconds": 300.243,
+    "offered_load_msg_per_sec": 2007.8769530014022,
+    "ack_throughput_msg_per_sec": 2007.8769530014022,
+    "receive_throughput_msg_per_sec": 2007.7137518609927,
+    "ack_success_rate_pct": 100.0,
+    "receive_success_rate_pct": 99.99187195509339,
+    "ack_avg_ms": 20.826565697827938,
+    "ack_p50_ms": 10.394203000032576,
+    "ack_p95_ms": 34.84341599869367,
+    "ack_p99_ms": 212.3815310005739,
+    "recv_avg_ms": 32.92630439946853,
+    "recv_p50_ms": 20.0,
+    "recv_p95_ms": 52.0,
+    "recv_p99_ms": 297.0,
+    "delivery_status_counts": {
+      "published_to_process": 985451,
+      "queued_to_socket": 44363,
+      "delivered_to_client": 1029814
+    },
+    "server_ack_status_counts": {
+      "published_to_process": 576888,
+      "queued_to_socket": 25963
+    },
+    "delivered_status_updates": 1029814,
+    "error_breakdown": {},
+    "source_latency_ranges": {
+      "ack_p95_ms": {
+        "min": 34.59725600077945,
+        "max": 34.84341599869367
+      },
+      "ack_p99_ms": {
+        "min": 196.94636199892557,
+        "max": 212.3815310005739
+      },
+      "recv_p95_ms": {
+        "min": 51.0,
+        "max": 52.0
+      },
+      "recv_p99_ms": {
+        "min": 282.0,
+        "max": 297.0
+      }
+    }
+  }
+}

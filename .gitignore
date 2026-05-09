@@ -1,6 +1,52 @@
-__pycache__/
+# Python
+
+**pycache**/
 *.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+
+env/
+venv/
 .venv/
-.env
+
+# Logs
+
+*.log
+
+# OS files
+
 .DS_Store
-load_tester/results/
+Thumbs.db
+
+# IDE
+
+.vscode/
+.idea/
+
+# PyQt generated UI (if you keep .ui as source)
+
+# comment this if you want to keep generated files
+
+# *_ui.py
+
+# Redis dump (if local)
+
+dump.rdb
+
+# Build / dist
+
+build/
+dist/
+*.egg-info/
+
+# Test artifacts
+
+.coverage
+htmlcov/
+
+# Secrets / env
+
+.env
+.env.*
